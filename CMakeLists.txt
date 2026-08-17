@@ -1,3 +1,19 @@
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.2.0)
+set(toolchainVersion 14_2_Rel1)
+set(picotoolVersion 2.2.0-a4)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
+set(PICO_BOARD pico CACHE STRING "Board type")
+
 cmake_minimum_required(VERSION 3.13...3.23)
 
 include(pico_sdk_import.cmake)
@@ -12,7 +28,7 @@ add_subdirectory(ext/FatFs_SPI build)
 
 add_executable(RP2040_GB
         src/main.c
-        src/mk_ili9225.c
+        src/mk_st75256.c
         ext/minigb_apu/minigb_apu.c
         ext/i2s/i2s.c
 )
@@ -23,8 +39,8 @@ target_include_directories(RP2040_GB PRIVATE inc ext/minigb_apu ext/i2s)
 
 target_link_libraries(RP2040_GB
         FatFs_SPI
-        pico_stdlib pico_stdio pico_bootrom pico_multicore pico_stdio  pico_multicore
-        hardware_clocks hardware_pio hardware_vreg hardware_pio
+        pico_stdlib pico_stdio pico_bootrom pico_multicore
+        hardware_clocks hardware_pio hardware_vreg
         hardware_sync hardware_pll hardware_spi hardware_irq hardware_dma
         pico_binary_info)
 target_compile_definitions(RP2040_GB PRIVATE

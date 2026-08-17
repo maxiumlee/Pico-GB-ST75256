@@ -60,7 +60,7 @@
 #include "hedley.h"
 #include "minigb_apu.h"
 #include "peanut_gb.h"
-#include "mk_ili9225.h"
+#include "mk_st75256.h"
 #include "sdcard.h"
 #include "i2s.h"
 #include "gbcolors.h"
@@ -101,8 +101,15 @@ uint16_t *stream;
 const uint8_t *rom = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
 static unsigned char rom_bank0[65536];
 
+/* The upstream ILI9225 menu uses 22 rows on a 176-pixel-tall panel.  This
+ * 160-pixel panel's text renderer has a 4-pixel top offset, leaving room for
+ * 19 complete 8-pixel rows per page. */
+#define ROM_MENU_PAGE_SIZE 19u
+
 static uint8_t ram[32768];
+#define CART_RAM_CAPACITY (sizeof(ram))
 static int lcd_line_busy = 0;
+static int lcd_core_ready = 0;
 static palette_t palette;	// Colour palette
 static uint8_t manual_palette_selected=0;
 
@@ -142,36 +149,8 @@ static uint8_t pixels_buffer[LCD_WIDTH];
 
 #define putstdio(x) write(1, x, strlen(x))
 
-/* Functions required for communication with the ILI9225. */
-void mk_ili9225_set_rst(bool state)
-{
-	gpio_put(GPIO_RST, state);
-}
-
-void mk_ili9225_set_rs(bool state)
-{
-	gpio_put(GPIO_RS, state);
-}
-
-void mk_ili9225_set_cs(bool state)
-{
-	gpio_put(GPIO_CS, state);
-}
-
-void mk_ili9225_set_led(bool state)
-{
-	gpio_put(GPIO_LED, state);
-}
-
-void mk_ili9225_spi_write16(const uint16_t *halfwords, size_t len)
-{
-	spi_write16_blocking(spi0, halfwords, len);
-}
-
-void mk_ili9225_delay_ms(unsigned ms)
-{
-	sleep_ms(ms);
-}
+/* JLX160160G-948/ST75161: GPIO and SPI are managed inside mk_st75256.c.
+ * The callback stubs that were needed for the ILI9225 are no longer required. */
 
 /**
  * Returns a byte from the ROM file at the given address.
@@ -191,6 +170,8 @@ uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr)
 uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr)
 {
 	(void) gb;
+	if(addr >= CART_RAM_CAPACITY)
+		return 0xFF;
 	return ram[addr];
 }
 
@@ -200,6 +181,9 @@ uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr)
 void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
 		       const uint8_t val)
 {
+	(void) gb;
+	if(addr >= CART_RAM_CAPACITY)
+		return;
 	ram[addr] = val;
 }
 
@@ -223,16 +207,32 @@ void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t addr
 #if ENABLE_LCD 
 void core1_lcd_draw_line(const uint_fast8_t line)
 {
-	static uint16_t fb[LCD_WIDTH];
+	/*
+	 * ST75161 four-gray vertical byte model:
+	 *   Column address = pixel column (0-159, one per column).
+	 *   Each byte covers 4 VERTICAL pixels: [row0|row1|row2|row3], 2 bpp.
+	 *
+	 * We accumulate 4 GB scanlines into a gray_row buffer, then call
+	 * mk_st75256_push_gb_line() which packs and flushes automatically
+	 * once the 4th row of a page is ready.
+	 *
+	 * pixels_buffer[x] from peanut_gb:
+	 *   bits [5:4] = palette selector  (LCD_PALETTE_ALL >> 4)
+	 *   bits [1:0] = colour index      (0–3)
+	 */
+	uint8_t gray_row[LCD_WIDTH];
 
-	for(unsigned int x = 0; x < LCD_WIDTH; x++)
+	for (unsigned int x = 0; x < LCD_WIDTH; x++)
 	{
-		fb[x] = palette[(pixels_buffer[x] & LCD_PALETTE_ALL) >> 4]
-				[pixels_buffer[x] & 3];
+		/* bits [1:0] of the peanut_gb pixel are already the shade index:
+		 * 0 = lightest (white), 3 = darkest (black).
+		 * This matches the ST75256 gray levels directly — no RGB565
+		 * lookup or conversion needed. */
+		gray_row[x] = pixels_buffer[x] & 0x03u;
 	}
 
-	mk_ili9225_set_x(line + 16);
-	mk_ili9225_write_pixels(fb, LCD_WIDTH);
+	/* push_gb_line accumulates rows and writes a page every 4 lines */
+	mk_st75256_push_gb_line((uint8_t)line, gray_row);
 	__atomic_store_n(&lcd_line_busy, 0, __ATOMIC_SEQ_CST);
 }
 
@@ -241,17 +241,11 @@ void main_core1(void)
 {
 	union core_cmd cmd;
 
-	/* Initialise and control LCD on core 1. */
-	mk_ili9225_init();
-
-	/* Clear LCD screen. */
-	mk_ili9225_fill(0x0000);
-
-	/* Set LCD window to DMG size. */
-	mk_ili9225_fill_rect(31,16,LCD_WIDTH,LCD_HEIGHT,0x0000);
-
-	// Sleep used for debugging LCD window.
-	//sleep_ms(1000);
+	/* Match the upstream Pico-GB lifecycle: each game display session starts
+	 * from a complete controller reset/init, independent of menu state. */
+	mk_st75256_init();
+	mk_st75256_fill(0);
+	__atomic_store_n(&lcd_core_ready, 1, __ATOMIC_SEQ_CST);
 
 	/* Handle commands coming from core0. */
 	while(1)
@@ -264,7 +258,7 @@ void main_core1(void)
 			break;
 
 		case CORE_CMD_IDLE_SET:
-			mk_ili9225_display_control(true, cmd.data);
+			mk_st75256_display_control(true, (st75256_color_mode_e)cmd.data);
 			break;
 
 		case CORE_CMD_NOP:
@@ -278,6 +272,25 @@ void main_core1(void)
 #endif
 
 #if ENABLE_LCD
+static bool lcd_wait_idle(uint32_t timeout_ms)
+{
+	/* Core 1 clears lcd_line_busy only after the complete SPI transfer and
+	 * after CS has been deasserted.  Do not wait forever if core 1 has
+	 * faulted: the next menu session performs a full hardware reset/init. */
+	absolute_time_t deadline=make_timeout_time_ms(timeout_ms);
+	while(__atomic_load_n(&lcd_line_busy, __ATOMIC_SEQ_CST)) {
+		if(time_reached(deadline)) {
+			gpio_put(GPIO_CS, 1);
+			return false;
+		}
+		tight_loop_contents();
+	}
+
+	/* Leave the controller deselected at every ownership boundary. */
+	gpio_put(GPIO_CS, 1);
+	return true;
+}
+
 void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
 		   const uint_fast8_t line)
 {
@@ -303,13 +316,23 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
  * Load a save file from the SD card
  */
 void read_cart_ram_file(struct gb_s *gb) {
-	char filename[16];
+	char filename[17];
 	uint_fast32_t save_size;
 	UINT br;
 	
+	/* A missing/invalid save must start with clean cartridge RAM instead of
+	 * inheriting the game that was running previously. */
+	memset(ram, 0, sizeof(ram));
 	gb_get_rom_name(gb,filename);
 	save_size=gb_get_save_size(gb);
 	if(save_size>0) {
+		if(save_size > CART_RAM_CAPACITY) {
+			printf("E save for %s needs %lu bytes; only %lu bytes are available\n",
+			       filename, (unsigned long)save_size,
+			       (unsigned long)CART_RAM_CAPACITY);
+			return;
+		}
+
 		sd_card_t *pSD=sd_get_by_num(0);
 		FRESULT fr=f_mount(&pSD->fatfs,pSD->pcName,1);
 		if (FR_OK!=fr) {
@@ -320,14 +343,20 @@ void read_cart_ram_file(struct gb_s *gb) {
 		FIL fil;
 		fr=f_open(&fil,filename,FA_READ);
 		if (fr==FR_OK) {
-			f_read(&fil,ram,f_size(&fil),&br);
+			FSIZE_t file_size=f_size(&fil);
+			UINT bytes_to_read=(UINT)((file_size < save_size) ? file_size : save_size);
+			fr=f_read(&fil,ram,bytes_to_read,&br);
+			if(fr!=FR_OK || br!=bytes_to_read) {
+				printf("E f_read(%s) error: %s (%d), %u/%u bytes\n",
+				       filename,FRESULT_str(fr),fr,br,bytes_to_read);
+				memset(ram,0,sizeof(ram));
+			}
+			FRESULT close_fr=f_close(&fil);
+			if(close_fr!=FR_OK) {
+				printf("E f_close error: %s (%d)\n",FRESULT_str(close_fr),close_fr);
+			}
 		} else {
 			printf("E f_open(%s) error: %s (%d)\n",filename,FRESULT_str(fr),fr);
-		}
-		
-		fr=f_close(&fil);
-		if(fr!=FR_OK) {
-			printf("E f_close error: %s (%d)\n", FRESULT_str(fr), fr);
 		}
 		f_unmount(pSD->pcName);
 	}
@@ -337,97 +366,149 @@ void read_cart_ram_file(struct gb_s *gb) {
 /**
  * Write a save file to the SD card
  */
-void write_cart_ram_file(struct gb_s *gb) {
-	char filename[16];
+bool write_cart_ram_file(struct gb_s *gb) {
+	char filename[17];
 	uint_fast32_t save_size;
 	UINT bw;
+	bool ok=true;
 	
 	gb_get_rom_name(gb,filename);
 	save_size=gb_get_save_size(gb);
 	if(save_size>0) {
+		if(save_size > CART_RAM_CAPACITY) {
+			printf("E refusing to truncate %s save: %lu bytes needed, %lu available\n",
+			       filename, (unsigned long)save_size,
+			       (unsigned long)CART_RAM_CAPACITY);
+			return false;
+		}
+
 		sd_card_t *pSD=sd_get_by_num(0);
 		FRESULT fr=f_mount(&pSD->fatfs,pSD->pcName,1);
 		if (FR_OK!=fr) {
 			printf("E f_mount error: %s (%d)\n",FRESULT_str(fr),fr);
-			return;
+			return false;
 		}
 
 		FIL fil;
 		fr=f_open(&fil,filename,FA_CREATE_ALWAYS | FA_WRITE);
 		if (fr==FR_OK) {
-			f_write(&fil,ram,save_size,&bw);
+			fr=f_write(&fil,ram,(UINT)save_size,&bw);
+			if(fr!=FR_OK || bw!=save_size) {
+				printf("E f_write(%s) error: %s (%d), %u/%lu bytes\n",
+				       filename,FRESULT_str(fr),fr,bw,(unsigned long)save_size);
+				ok=false;
+			}
+			FRESULT close_fr=f_close(&fil);
+			if(close_fr!=FR_OK) {
+				printf("E f_close error: %s (%d)\n",FRESULT_str(close_fr),close_fr);
+				ok=false;
+			}
 		} else {
 			printf("E f_open(%s) error: %s (%d)\n",filename,FRESULT_str(fr),fr);
-		}
-		
-		fr=f_close(&fil);
-		if(fr!=FR_OK) {
-			printf("E f_close error: %s (%d)\n", FRESULT_str(fr), fr);
+			ok=false;
 		}
 		f_unmount(pSD->pcName);
 	}
-	printf("I write_cart_ram_file(%s) COMPLETE (%lu bytes)\n",filename,save_size);
+	printf("I write_cart_ram_file(%s) %s (%lu bytes)\n",
+	       filename, ok ? "COMPLETE" : "FAILED", save_size);
+	return ok;
 }
 
 /**
  * Load a .gb rom file in flash from the SD card 
  */ 
-void load_cart_rom_file(char *filename) {
+bool load_cart_rom_file(const char *filename) {
 	UINT br;
-	uint8_t buffer[FLASH_SECTOR_SIZE];
+	/* Core 0 only has a small stack. Keep this sector buffer in BSS; placing
+	 * it on the stack together with the selector's filenames corrupted
+	 * emulator and display state. */
+	static uint8_t buffer[FLASH_SECTOR_SIZE] __attribute__((aligned(FLASH_PAGE_SIZE)));
 	bool mismatch=false;
+	bool file_open=false;
+	uint32_t total_bytes=0;
 	sd_card_t *pSD=sd_get_by_num(0);
 	FRESULT fr=f_mount(&pSD->fatfs,pSD->pcName,1);
 	if (FR_OK!=fr) {
 		printf("E f_mount error: %s (%d)\n",FRESULT_str(fr),fr);
-		return;
+		return false;
 	}
 	FIL fil;
 	fr=f_open(&fil,filename,FA_READ);
 	if (fr==FR_OK) {
+		file_open=true;
+		FSIZE_t rom_size=f_size(&fil);
+		if(rom_size==0 || rom_size > (PICO_FLASH_SIZE_BYTES-FLASH_TARGET_OFFSET)) {
+			printf("E invalid ROM size for %s: %lu bytes\n",
+			       filename,(unsigned long)rom_size);
+			f_close(&fil);
+			file_open=false;
+			f_unmount(pSD->pcName);
+			return false;
+		}
+
 		uint32_t flash_target_offset=FLASH_TARGET_OFFSET;
 		for(;;) {
-			f_read(&fil,buffer,sizeof buffer,&br);
+			memset(buffer,0xFF,sizeof(buffer));
+			fr=f_read(&fil,buffer,sizeof buffer,&br);
+			if(fr!=FR_OK) {
+				printf("E f_read(%s) error: %s (%d)\n",filename,FRESULT_str(fr),fr);
+				mismatch=true;
+				break;
+			}
 			if(br==0) break; /* end of file */
 
+			/* flash_range_* temporarily disables XIP.  Core 1 is stopped while
+			 * the menu is active; also mask core 0 interrupts so no handler can
+			 * try to execute from flash during erase/program. */
 			printf("I Erasing target region...\n");
-			flash_range_erase(flash_target_offset,FLASH_SECTOR_SIZE);
 			printf("I Programming target region...\n");
+			uint32_t interrupt_state=save_and_disable_interrupts();
+			flash_range_erase(flash_target_offset,FLASH_SECTOR_SIZE);
 			flash_range_program(flash_target_offset,buffer,FLASH_SECTOR_SIZE);
+			restore_interrupts(interrupt_state);
 			
 			/* Read back target region and check programming */
 			printf("I Done. Reading back target region...\n");
+			const uint8_t *programmed=(const uint8_t *)(XIP_BASE+flash_target_offset);
 			for(uint32_t i=0;i<FLASH_SECTOR_SIZE;i++) {
-				if(rom[flash_target_offset+i]!=buffer[i]) {
+				if(programmed[i]!=buffer[i]) {
 					mismatch=true;
+					break;
 				}
 			}
 
 			/* Next sector */
+			total_bytes+=br;
 			flash_target_offset+=FLASH_SECTOR_SIZE;
 		}
 		if(mismatch) {
-	        printf("I Programming successful!\n");
-		} else {
 			printf("E Programming failed!\n");
+		} else {
+	        printf("I Programming successful!\n");
 		}
 	} else {
 		printf("E f_open(%s) error: %s (%d)\n",filename,FRESULT_str(fr),fr);
 	}
 	
-	fr=f_close(&fil);
-	if(fr!=FR_OK) {
-		printf("E f_close error: %s (%d)\n", FRESULT_str(fr), fr);
+	if(file_open) {
+		FRESULT close_fr=f_close(&fil);
+		if(close_fr!=FR_OK) {
+			printf("E f_close error: %s (%d)\n", FRESULT_str(close_fr), close_fr);
+			mismatch=true;
+		}
 	}
 	f_unmount(pSD->pcName);
 
-	printf("I load_cart_rom_file(%s) COMPLETE (%lu bytes)\n",filename,br);
+	printf("I load_cart_rom_file(%s) COMPLETE (%lu bytes)\n",
+	       filename,(unsigned long)total_bytes);
+	return fr==FR_OK && !mismatch && total_bytes>0;
 }
 
 /**
  * Function used by the rom file selector to display one page of .gb rom files
  */
-uint16_t rom_file_selector_display_page(char filename[22][256],uint16_t num_page) {
+uint16_t rom_file_selector_display_page(
+	char filename[ROM_MENU_PAGE_SIZE][256], uint16_t num_page) {
 	sd_card_t *pSD=sd_get_by_num(0);
     DIR dj;
     FILINFO fno;
@@ -440,7 +521,7 @@ uint16_t rom_file_selector_display_page(char filename[22][256],uint16_t num_page
     }
 
 	/* clear the filenames array */
-	for(uint8_t ifile=0;ifile<22;ifile++) {
+	for(uint8_t ifile=0;ifile<ROM_MENU_PAGE_SIZE;ifile++) {
 		strcpy(filename[ifile],"");
 	}
 
@@ -450,7 +531,7 @@ uint16_t rom_file_selector_display_page(char filename[22][256],uint16_t num_page
 
 	/* skip the first N pages */
 	if(num_page>0) {
-		while(num_file<num_page*22 && fr == FR_OK && fno.fname[0]) {
+		while(num_file<num_page*ROM_MENU_PAGE_SIZE && fr == FR_OK && fno.fname[0]) {
 			num_file++;
 			fr=f_findnext(&dj, &fno);
 		}
@@ -458,7 +539,7 @@ uint16_t rom_file_selector_display_page(char filename[22][256],uint16_t num_page
 
 	/* store the filenames of this page */
 	num_file=0;
-    while(num_file<22 && fr == FR_OK && fno.fname[0]) {
+    while(num_file<ROM_MENU_PAGE_SIZE && fr == FR_OK && fno.fname[0]) {
 		strcpy(filename[num_file],fno.fname);
         num_file++;
         fr=f_findnext(&dj, &fno);
@@ -467,29 +548,44 @@ uint16_t rom_file_selector_display_page(char filename[22][256],uint16_t num_page
 	f_unmount(pSD->pcName);
 
 	/* display *.gb rom files on screen */
-	mk_ili9225_fill(0x0000);
+	mk_st75256_fill(0);   /* white background */
 	for(uint8_t ifile=0;ifile<num_file;ifile++) {
-		mk_ili9225_text(filename[ifile],0,ifile*8,0xFFFF,0x0000);
+		mk_st75256_text(filename[ifile],0,ifile*8,0x0000,0xFFFF);
     }
 	return num_file;
 }
 
 /**
- * The ROM selector displays pages of up to 22 rom files
+ * The ROM selector displays one screen-sized page of ROM files
  * allowing the user to select which rom file to start
  * Copy your *.gb rom files to the root directory of the SD card
  */
 void rom_file_selector() {
-    uint16_t num_page;
-	char filename[22][256];
+	uint16_t num_page=0;
+	/* Long filenames do not fit safely on core 0's small stack. Static
+	 * storage also keeps them away from nested flash I/O calls. */
+	static char filename[ROM_MENU_PAGE_SIZE][256];
 	uint16_t num_file;
+
+	/* The save hotkey uses SELECT+START. Wait for those keys to be released
+	 * so returning to this menu cannot immediately restart the old ROM. */
+	while(!gpio_get(GPIO_A) || !gpio_get(GPIO_B) ||
+	      !gpio_get(GPIO_SELECT) || !gpio_get(GPIO_START)) {
+		sleep_ms(10);
+	}
 	
-	/* display the first page with up to 22 rom files */
-	num_file=rom_file_selector_display_page(filename,num_page);
+	/* Display the first page of ROM files. */
+	do {
+		num_file=rom_file_selector_display_page(filename,num_page);
+		if(num_file!=0)
+			break;
+		printf("E no .gb files found\n");
+		sleep_ms(500);
+	} while(true);
 
 	/* select the first rom */
 	uint8_t selected=0;
-	mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+	mk_st75256_text(filename[selected],0,selected*8,0x0000,0xAD55); /* dark text, mid-gray bg */
 
 	/* get user's input */
 	bool up,down,left,right,a,b,select,start;
@@ -502,32 +598,33 @@ void rom_file_selector() {
 		b=gpio_get(GPIO_B);
 		select=gpio_get(GPIO_SELECT);
 		start=gpio_get(GPIO_START);
-		if(!start) {
-			/* re-start the last game (no need to reprogram flash) */
-			break;
-		}
-		if(!a | !b) {
-			/* copy the rom from the SD card to flash and start the game */
-			load_cart_rom_file(filename[selected]);
-			break;
+		if(!start || !a || !b) {
+			/* START/A/B all confirm the highlighted entry.  The old START
+			 * shortcut skipped loading and silently restarted the ROM already
+			 * in flash, which made selection appear broken after saving. */
+			if(load_cart_rom_file(filename[selected]))
+				break;
+			/* Keep the selector active if loading failed; otherwise the old
+			 * flash contents would look like the selected game. */
+			sleep_ms(150);
 		}
 		if(!down) {
 			/* select the next rom */
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0x0000);
+			mk_st75256_text(filename[selected],0,selected*8,0x0000,0xFFFF);
 			selected++;
 			if(selected>=num_file) selected=0;
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+			mk_st75256_text(filename[selected],0,selected*8,0x0000,0xAD55);
 			sleep_ms(150);
 		}
 		if(!up) {
 			/* select the previous rom */
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0x0000);
+			mk_st75256_text(filename[selected],0,selected*8,0x0000,0xFFFF);
 			if(selected==0) {
 				selected=num_file-1;
 			} else {
 				selected--;
 			}
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+			mk_st75256_text(filename[selected],0,selected*8,0x0000,0xAD55);
 			sleep_ms(150);
 		}
 		if(!right) {
@@ -541,7 +638,7 @@ void rom_file_selector() {
 			}
 			/* select the first file */
 			selected=0;
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+			mk_st75256_text(filename[selected],0,selected*8,0x0000,0xAD55);
 			sleep_ms(150);
 		}
 		if((!left) && num_page>0) {
@@ -550,7 +647,7 @@ void rom_file_selector() {
 			num_file=rom_file_selector_display_page(filename,num_page);
 			/* select the first file */
 			selected=0;
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+			mk_st75256_text(filename[selected],0,selected*8,0x0000,0xAD55);
 			sleep_ms(150);
 		}
 		tight_loop_contents();
@@ -626,8 +723,8 @@ int main(void)
 			CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
 			125 * 1000 * 1000, 125 * 1000 * 1000);
 	spi_init(spi0, 30*1000*1000);
-	spi_set_format(spi0, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-
+	/* ST75161 uses 8-bit SPI (ILI9225 used 16-bit – this is the key change). */
+	spi_set_format(spi0, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 #if ENABLE_SOUND
 	// Allocate memory for the stream buffer
 	stream=malloc(AUDIO_BUFFER_SIZE_BYTES);
@@ -645,10 +742,12 @@ int main(void)
 while(true)
 {
 #if ENABLE_LCD
+	/* Follow upstream Pico-GB: a menu session always begins with a fresh LCD
+	 * init.  This covers cold power-on and every save/return path alike. */
+	mk_st75256_init();
+	mk_st75256_fill(0);
 #if ENABLE_SDCARD
 	/* ROM File selector */
-	mk_ili9225_init();
-	mk_ili9225_fill(0x0000);
 	rom_file_selector();
 #endif
 #endif
@@ -666,7 +765,7 @@ while(true)
 	}
 
 	/* Automatically assign a colour palette to the game */
-	char rom_title[16];
+	char rom_title[17];
 	auto_assign_palette(palette, gb_colour_hash(&gb),gb_get_rom_name(&gb,rom_title));
 	
 #if ENABLE_LCD
@@ -674,7 +773,31 @@ while(true)
 
 	/* Start Core1, which processes requests to the LCD. */
 	putstdio("CORE1 ");
-	multicore_launch_core1(main_core1);
+	bool lcd_started=false;
+	for(uint8_t attempt=0; attempt<2 && !lcd_started; attempt++) {
+		__atomic_store_n(&lcd_line_busy,0,__ATOMIC_SEQ_CST);
+		__atomic_store_n(&lcd_core_ready,0,__ATOMIC_SEQ_CST);
+		multicore_fifo_drain();
+		multicore_launch_core1(main_core1);
+
+		absolute_time_t deadline=make_timeout_time_ms(1500);
+		while(!__atomic_load_n(&lcd_core_ready,__ATOMIC_SEQ_CST) &&
+		      !time_reached(deadline))
+			tight_loop_contents();
+
+		if(__atomic_load_n(&lcd_core_ready,__ATOMIC_SEQ_CST)) {
+			lcd_started=true;
+		} else {
+			puts("W LCD core init timeout; retrying");
+			multicore_reset_core1();
+			multicore_fifo_drain();
+			gpio_put(GPIO_CS,1);
+		}
+	}
+	if(!lcd_started) {
+		puts("E LCD core failed to initialise");
+		goto out;
+	}
 	
 	putstdio("LCD ");
 #endif
@@ -759,8 +882,16 @@ while(true)
 			}
 			if(!gb.direct.joypad_bits.start && prev_joypad_bits.start) {
 				/* select + start: save ram and resets to the game selection menu */
+#if ENABLE_LCD
+				/* Best effort only; exit recovery must not be blocked forever by
+				 * a failed display transaction. */
+				(void)lcd_wait_idle(100);
+#endif
 #if ENABLE_SDCARD				
-				write_cart_ram_file(&gb);
+				if(!write_cart_ram_file(&gb)) {
+					puts("E save failed; keeping current game running");
+					continue;
+				}
 #endif				
 				goto out;
 			}
@@ -778,27 +909,9 @@ while(true)
 
 		switch(input)
 		{
-#if 0
-		static bool invert = false;
-		static bool sleep = false;
-		static uint8_t freq = 1;
-		static ili9225_color_mode_e colour = ILI9225_COLOR_MODE_FULL;
-
-		case 'i':
-			invert = !invert;
-			mk_ili9225_display_control(invert, colour);
-			break;
-
-		case 'f':
-			freq++;
-			freq &= 0x0F;
-			mk_ili9225_set_drive_freq(freq);
-			printf("Freq %u\n", freq);
-			break;
-#endif
 		case 'c':
 		{
-			static ili9225_color_mode_e mode = ILI9225_COLOR_MODE_FULL;
+			static st75256_color_mode_e mode = ST75256_COLOR_MODE_FULL;
 			union core_cmd cmd;
 
 			mode = !mode;
@@ -895,7 +1008,14 @@ while(true)
 out:
 	puts("\nEmulation Ended");
 	/* stop lcd task running on core 1 */
-	multicore_reset_core1(); 
+#if ENABLE_LCD
+	if(!lcd_wait_idle(100))
+		puts("W LCD transfer timeout; forcing display-core reset");
+#endif
+	multicore_reset_core1();
+	multicore_fifo_drain();
+	__atomic_store_n(&lcd_line_busy,0,__ATOMIC_SEQ_CST);
+	__atomic_store_n(&lcd_core_ready,0,__ATOMIC_SEQ_CST);
 
 }
 

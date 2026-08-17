@@ -1,2 +1,23 @@
-build
-uf2
+# Build output
+build/
+build-*/
+cmake-build-*/
+out/
+*.bin
+*.dis
+*.elf
+*.hex
+*.map
+*.uf2
+
+# Local SDKs, restored dependencies, and reference checkouts
+.deps/
+.dependency-*/
+
+# Editor and temporary files
+.clangd
+.vscode/
+tmp/
+
+# Local legacy experiment; the maintained driver is in src/mk_st75256.c
+Pico-GB-JLX160160G-mono/
