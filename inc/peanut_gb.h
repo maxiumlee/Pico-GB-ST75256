@@ -3504,13 +3504,16 @@ uint_fast32_t gb_get_save_size(struct gb_s *gb)
 	const uint_fast16_t ram_size_location = 0x0149;
 	const uint_fast32_t ram_sizes[] =
 	{
-		0x00, 0x800, 0x2000, 0x8000, 0x20000
+		0x00, 0x800, 0x2000, 0x8000, 0x20000, 0x10000
 	};
 	uint8_t ram_size = gb->gb_rom_read(gb, ram_size_location);
 
 	/* MBC2 always has 512 half-bytes of cart RAM. */
 	if(gb->mbc == 2)
 		return 0x200;
+
+	if(ram_size >= sizeof(ram_sizes)/sizeof(ram_sizes[0]))
+		return 0;
 
 	return ram_sizes[ram_size];
 }
